@@ -95,7 +95,7 @@ def get_model():
     session = ort.InferenceSession(
         model_path, sess_options=options, providers=["CPUExecutionProvider"]
     )
-    tokenizer = Tokenizer.from_file(tokenizer_path)
+tokenizer = Tokenizer.from_file(str(tokenizer_path))
     tokenizer.enable_truncation(max_length=256)
     return E5OnnxEncoder(session, tokenizer)
 
