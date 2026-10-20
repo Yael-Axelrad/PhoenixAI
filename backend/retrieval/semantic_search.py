@@ -75,18 +75,17 @@ RRF_K = 60
 def get_model():
     """Load the same multilingual E5 model through compact ONNX inference."""
     import onnxruntime as ort
-    from huggingface_hub import hf_hub_download
     from tokenizers import Tokenizer
 
-    logger.info("Loading quantized ONNX E5 model (no PyTorch)")
-    model_path = hf_hub_download(
-        repo_id="Xenova/multilingual-e5-small",
-        filename="onnx/model_quantized.onnx",
-    )
-    tokenizer_path = hf_hub_download(
-        repo_id="Xenova/multilingual-e5-small",
-        filename="tokenizer.json",
-    )
+    model_dir = PROJECT_ROOT / "models" / "e5-onnx"
+    model_path = model_dir / "onnx" / "model_quantized.onnx"
+    tokenizer_path = model_dir / "tokenizer.json"
+    if not model_path.is_file() or not tokenizer_path.is_file():
+        raise FileNotFoundError(
+            "ONNX model files are missing. Set Render Build Command to: "
+            "pip install -r requirements-render.txt && python scripts/download_e5_onnx.py"
+        )
+    logger.info("Loading local quantized ONNX E5 model: %s", model_path)
     options = ort.SessionOptions()
     options.intra_op_num_threads = 1
     options.inter_op_num_threads = 1
@@ -97,7 +96,7 @@ def get_model():
         model_path, sess_options=options, providers=["CPUExecutionProvider"]
     )
     tokenizer = Tokenizer.from_file(tokenizer_path)
-    tokenizer.enable_truncation(max_length=512)
+    tokenizer.enable_truncation(max_length=256)
     return E5OnnxEncoder(session, tokenizer)
 
 
@@ -152,7 +151,7 @@ def load_chunks() -> list[dict]:
 @lru_cache(maxsize=1)
 def load_embeddings() -> np.ndarray:
     start = time.perf_counter()
-    embeddings = np.load(INDEX_FILE, allow_pickle=False)
+    embeddings = np.load(INDEX_FILE, allow_pickle=False, mmap_mode="r")
     logger.info(
         "Loaded embedding index: shape=%s in %.2fs",
         embeddings.shape,
@@ -162,24 +161,8 @@ def load_embeddings() -> np.ndarray:
 def build_index() -> None:
     """Index building is disabled in the lean runtime to preserve existing vectors."""
     raise RuntimeError("Keep existing embeddings.npy. Rebuild only in the original PyTorch environment.")
-    chunks = load_chunks()
-    if not chunks:
-        raise ValueError("No chunks available for indexing.")
-    model = get_model()
-    texts = [
-        f"passage: {chunk['title']}\n{chunk['content']}"
-        for chunk in chunks
-    ]
-    embeddings = model.encode(
-        texts,
-        normalize_embeddings=True,
-        show_progress_bar=True,
-        batch_size=32,
-    )
-    INDEX_FILE.parent.mkdir(parents=True, exist_ok=True)
-    np.save(INDEX_FILE, embeddings)
-    load_embeddings.cache_clear()
-    logger.info("Saved %d embeddings", len(embeddings))
+
+
 def tokenize(text: str) -> list[str]:
     """Tokenize Hebrew and English text."""
     return [
