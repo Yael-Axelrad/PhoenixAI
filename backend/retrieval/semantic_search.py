@@ -528,7 +528,15 @@ def search(
     chunks = load_chunks()
 
     semantic_start = time.perf_counter()
-    dense_results = semantic_search(query, top_k=60)
+    semantic_start = time.perf_counter()
+
+    if os.getenv("RETRIEVAL_LEXICAL_ONLY", "").lower() == "true":
+        logger.info("Lexical-only retrieval enabled; skipping ONNX")
+        dense_results = []
+    else:
+        dense_results = semantic_search(query, top_k=60)
+
+    semantic_seconds = time.perf_counter() - semantic_start
     semantic_seconds = time.perf_counter() - semantic_start
 
     lexical_start = time.perf_counter()
