@@ -41,6 +41,8 @@ from google import genai
 from google.genai import types
 
 from google.genai.errors import APIError
+import requests
+import truststore
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
@@ -51,10 +53,16 @@ sys.path.insert(0, str(PROJECT_ROOT / "backend" / "retrieval"))
 from semantic_search import search  # noqa: E402
 
 MODEL_NAME = os.getenv("GEMINI_MODEL", "gemini-3.5-flash").strip()
+GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b").strip()
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
+GROQ_TIMEOUT_SECONDS = max(5, min(45, int(os.getenv("GROQ_TIMEOUT_SECONDS", "25"))))
+
+# Windows certificate store support for filtered networks. Never disable TLS verification.
+truststore.inject_into_ssl()
 
 MAX_SOURCES = 4
 
-MAX_SOURCE_CHARACTERS = 1150
+MAX_SOURCE_CHARACTERS = 650
 
 MAX_OUTPUT_TOKENS = 1200
 
@@ -68,7 +76,7 @@ GEMINI_TIMEOUT_MS = max(5000, min(45000, int(os.getenv("GEMINI_TIMEOUT_MS", "120
 
 GEMINI_BACKUP_MODEL = os.getenv("GEMINI_BACKUP_MODEL", "").strip()
 
-CACHE_VERSION = "phoenixai-rag-v10-subtype-followups"
+CACHE_VERSION = "phoenixai-rag-v13-water-source-precision"
 
 REFUSAL_MESSAGE = "אין לי כרגע מידע מאומת שמאפשר לתת תשובה מדויקת לשאלה הזאת. אפשר לפנות למרכז השירות שלנו לבירור נוסף."
 
@@ -210,7 +218,7 @@ TOPIC_CUES = {
 
     "pension": ("פנסיה", "גמל", "השתלמות", "פרישה"),
 
-    "life": ("ביטוח חיים", "פטירה", "מוטבים"),
+    "life": ("ביטוח חיים", "ביטוח ריסק", "ריסק", "פטירה", "מוטבים"),
 
     "business": ("עסק", "לעסק", "עסקי"),
 
@@ -243,22 +251,36 @@ WATER_TERMS = ("נזקי מים", "נזק מים", "נזקי צנרת", "נזק 
 THIRD_PARTY_TERMS = ("צד ג'", "צד ג׳", "צד שלישי", "צד 3")
 
 # Distinguish car property claims from bodily-injury (compulsory motor) claims.
+
 # This is independent of the broad car product scope.
+
 CAR_PROPERTY_CUES = (
+
     "רכב חונה", "הרכב שלי", "הרכב השני", "נזק לרכב", "נזקי רכב",
+
     "נזק לרכוש", "נזקי רכוש", "תיקון הרכב", "תיקון רכב", "פחחות",
+
     "ביטוח מקיף", "ביטוח צד ג", "שמאי", "תביעת רכוש",
-)
-CAR_BODY_CUES = (
-    "נזקי גוף", "נזק גוף", "פגיעת גוף", "פגיעות גוף", "נפגעי גוף",
-    "פציעה", "נפצע", "נפגעתי", "פינוי לבית חולים", "טיפול רפואי",
-    "ביטוח חובה", "נפצעתי", "נפצעת", "נפצעו", "נפצענו",
-)
-CAR_BODY_CLAIM_PATHS = ("compulsory-motor-claims",)
-CAR_PROPERTY_CLAIM_PATHS = (
-    "claims-property-car-insurance", "claims-car-insurance-third-party",
+
 )
 
+CAR_BODY_CUES = (
+
+    "נזקי גוף", "נזק גוף", "פגיעת גוף", "פגיעות גוף", "נפגעי גוף",
+
+    "פציעה", "נפצע", "נפגעתי", "פינוי לבית חולים", "טיפול רפואי",
+
+    "ביטוח חובה", "נפצעתי", "נפצעת", "נפצעו", "נפצענו",
+
+)
+
+CAR_BODY_CLAIM_PATHS = ("compulsory-motor-claims",)
+
+CAR_PROPERTY_CLAIM_PATHS = (
+
+    "claims-property-car-insurance", "claims-car-insurance-third-party",
+
+)
 
 TIMELINE_TERMS = ("תוך כמה זמן", "כמה זמן", "מתי מקבלים", "מתי אקבל", "משך הטיפול", "זמן טיפול")
 
@@ -269,55 +291,91 @@ def _contains_any(text: str, terms: tuple[str, ...]) -> bool:
     return any(term in text for term in terms)
 
 def _last_car_subtype(history: list[dict]) -> str | None:
+
     """Last explicitly mentioned car claim subtype, from USER turns only."""
+
     for previous in reversed(_recent_user_questions(history)):
+
         body = _contains_any(previous, CAR_BODY_CUES)
+
         prop = _contains_any(previous, CAR_PROPERTY_CUES)
+
         if body != prop:
+
             return "body" if body else "property"
+
     return None
 
-
 def _active_scope(question: str, history: list[dict]) -> dict:
+
     """Resolve product and most recent claim subtype independently."""
+
     anchor = _find_context_anchor(question, history)
+
     relevant = f"{anchor} {question}" if anchor else question
+
     topics = _topics(relevant)
 
     if "apartment" in topics and "car" in topics:
+
         explicit_car = _contains_any(relevant, ("רכב", "לרכב", "מכונית", "נהיגה", "נהג"))
+
         explicit_apartment = _contains_any(relevant, ("דירה", "בדירה", "צנרת", "נזילה", "נזקי מים"))
+
         if explicit_apartment and not explicit_car:
+
             topics.discard("car")
 
     water = "apartment" in topics and _contains_any(relevant, WATER_TERMS)
+
     explicit_third_party = _contains_any(question, THIRD_PARTY_TERMS)
 
     # An explicit change of claim subtype takes precedence over old history.
+
     current_body = _contains_any(question, CAR_BODY_CUES)
+
     current_property = _contains_any(question, CAR_PROPERTY_CUES)
+
     if "car" not in topics and anchor and current_body and "car" in _topics(anchor):
+
         topics.add("car")
 
     car_property = False
+
     car_body = False
+
     if "car" in topics:
+
         if current_body != current_property:
+
             car_body, car_property = current_body, current_property
+
         elif is_follow_up_question(question, history) and not current_body and not current_property:
+
             subtype = _last_car_subtype(history)
+
             if subtype == "body":
+
                 car_body = True
+
             elif subtype == "property":
+
                 car_property = True
+
         else:
+
             car_body = _contains_any(relevant, CAR_BODY_CUES)
+
             car_property = _contains_any(relevant, CAR_PROPERTY_CUES)
 
     return {
+
         "topics": topics, "water": water, "third_party": explicit_third_party,
+
         "timeline": _contains_any(question, TIMELINE_TERMS), "anchor": anchor,
+
         "car_property": car_property, "car_body": car_body,
+
     }
 
 def _source_matches_scope(source: dict, scope: dict) -> bool:
@@ -335,18 +393,27 @@ def _source_matches_scope(source: dict, scope: dict) -> bool:
             return False
 
     if scope.get("car_property") and not scope.get("car_body"):
+
         if any(fragment in path for fragment in CAR_BODY_CLAIM_PATHS):
+
             return False
+
     if scope.get("car_body") and not scope.get("car_property"):
+
         # Only compulsory-motor bodily-injury claims provide the right process.
+
         if not any(fragment in path for fragment in CAR_BODY_CLAIM_PATHS):
+
             return False
+
     if scope["water"] and not scope["third_party"]:
 
-        # Explicit third-party claims have different requirements and deadlines.
+        # The generic claims landing page mixes apartment and third-party flows.
+        # Prefer dedicated apartment/pipeline pages for own-property water damage.
+        if path.rstrip("/").endswith("/claims-appartment-insurance"):
+            return False
 
         if "claims-third-party-house" in path or "third-party" in path:
-
             return False
 
     return True
@@ -406,53 +473,91 @@ def is_follow_up_question(question: str, history: list[dict]) -> bool:
         return False
 
     # Users sometimes paste numbered questions ("1. ואם...").
+
     q = re.sub(r"^\s*\d+\s*[.)\-]\s*", "", question).strip()
 
     return q.startswith(FOLLOWUP_MARKERS) or (len(q) <= 35 and not _topics(q))
 
 def _find_context_anchor(question: str, history: list[dict]) -> str | None:
+
     """Find a compatible user topic; never use assistant-generated claims as evidence."""
+
     previous_questions = _recent_user_questions(history)
+
     if not previous_questions or not is_follow_up_question(question, history):
+
         return None
 
     current_topics = _topics(question)
+
+    # A new explicit product topic must not inherit the previous question.
+
+    if current_topics:
+
+        return None
+
     for previous in reversed(previous_questions):
+
         previous_topics = _topics(previous)
+
         if not previous_topics:
+
             continue
+
         if current_topics and not (current_topics & previous_topics):
+
             return None
+
         return previous
+
     return None
 
-
 def _retrieval_context(question: str, history: list[dict]) -> str | None:
+
     """Keep the latest subtype-specific user question in short follow-up searches."""
+
     anchor = _find_context_anchor(question, history)
+
     if not anchor:
+
         return None
+
     scope = _active_scope(question, history)
+
     if "car" not in scope["topics"] or not is_follow_up_question(question, history):
+
         return anchor
+
     if _contains_any(question, CAR_BODY_CUES + CAR_PROPERTY_CUES):
+
         return anchor
 
     target = "body" if scope["car_body"] and not scope["car_property"] else (
+
         "property" if scope["car_property"] and not scope["car_body"] else None
+
     )
+
     if target:
+
         for previous in reversed(_recent_user_questions(history)):
+
             body = _contains_any(previous, CAR_BODY_CUES)
+
             prop = _contains_any(previous, CAR_PROPERTY_CUES)
+
             if (target == "body" and body and not prop) or (target == "property" and prop and not body):
+
                 # The subtype-specific turn can be enough to retrieve the correct page.
+
                 return previous
+
     return anchor
 
-
 def build_retrieval_queries(question: str, history: list[dict]) -> list[str]:
+
     anchor = _retrieval_context(question, history)
+
     return [f"{anchor} {question}"] if anchor else [question]
 
 def build_history_text(history: list[dict]) -> str:
@@ -522,6 +627,17 @@ def retrieve_candidates(queries: list[str], request_id: str) -> list[dict]:
 def prepare_sources(candidates: list[dict], request_id: str, scope: dict | None = None) -> list[dict]:
 
     selected, deferred, seen_urls = [], [], set()
+
+    # Prioritize the dedicated pipeline-damage procedure over generic articles.
+    # Do not discard other relevant apartment pages: they can supply context.
+    if scope and scope.get("water") and not scope.get("third_party"):
+        candidates = sorted(
+            candidates,
+            key=lambda item: (
+                "pipeline-damage" not in urlparse(str(item.get("url", ""))).path.lower(),
+                -float(item.get("_ranking_score", 0.0)),
+            ),
+        )
 
     for item in candidates:
 
@@ -677,7 +793,7 @@ def _cache_key(question: str, history: list[dict]) -> str:
 
         "version": CACHE_VERSION,
 
-        "model": MODEL_NAME,
+        "model": f"groq:{GROQ_MODEL}|gemini:{MODEL_NAME}|backup:{GEMINI_BACKUP_MODEL}",
 
         "corpus": _corpus_signature(),
 
@@ -823,17 +939,31 @@ def generate_answer(prompt: str, request_id: str, model: str | None = None):
 
     try:
 
-        logger.info("[%s] GEMINI_START | model=%s | prompt_chars=%d", request_id, model, len(prompt))
+        logger.info(
 
-        response = client.models.generate_content(
+            "[%s] GEMINI_START | model=%s | prompt_chars=%d",
 
-            model=model, contents=prompt, config=_generate_config()
+            request_id, model, len(prompt)
 
         )
 
-        logger.info("[%s] GEMINI_HTTP_OK | model=%s | seconds=%.2f",
+        response = client.models.generate_content(
 
-                    request_id, model, time.perf_counter() - started)
+            model=model,
+
+            contents=prompt,
+
+            config=_generate_config()
+
+        )
+
+        logger.info(
+
+            "[%s] GEMINI_HTTP_OK | model=%s | seconds=%.2f",
+
+            request_id, model, time.perf_counter() - started
+
+        )
 
         return response
 
@@ -841,36 +971,115 @@ def generate_answer(prompt: str, request_id: str, model: str | None = None):
 
         status = getattr(error, "code", None)
 
-        logger.error("[%s] GEMINI_API_ERROR | model=%s | status=%s | seconds=%.2f",
+        error_message = str(getattr(error, "message", "") or "")
 
-                     request_id, model, status, time.perf_counter() - started)
+        error_message = error_message.replace("\n", " ")[:1000]
+
+        logger.error(
+
+            "[%s] GEMINI_API_ERROR | model=%s | status=%s | seconds=%.2f | message=%s",
+
+            request_id,
+
+            model,
+
+            status,
+
+            time.perf_counter() - started,
+
+            error_message,
+
+        )
 
         if status == 429:
 
             _mark_quota_blocked()
 
-            logger.warning("[%s] QUOTA_EXCEEDED | cooldown=30min", request_id)
+            logger.warning(
+
+                "[%s] QUOTA_EXCEEDED | cooldown=30min",
+
+                request_id
+
+            )
 
             return None
 
         if status in (500, 502, 503, 504):
 
-            raise TransientGenerationError(f"Gemini temporary HTTP {status}") from error
+            raise TransientGenerationError(
+
+                f"Gemini temporary HTTP {status}"
+
+            ) from error
 
         return None
 
     except (TimeoutError, ConnectionError) as error:
 
-        logger.warning("[%s] GEMINI_NETWORK_ERROR | model=%s | error=%s",
+        logger.warning(
 
-                       request_id, model, type(error).__name__)
+            "[%s] GEMINI_NETWORK_ERROR | model=%s | error=%s",
+
+            request_id, model, type(error).__name__
+
+        )
 
         raise TransientGenerationError(type(error).__name__) from error
 
     except Exception:
 
-        logger.exception("[%s] GEMINI_CLIENT_ERROR | model=%s", request_id, model)
+        logger.exception(
 
+            "[%s] GEMINI_CLIENT_ERROR | model=%s",
+
+            request_id, model
+
+        )
+
+        return None
+
+def _groq_answer(prompt: str, request_id: str) -> dict | None:
+    """Generate strict JSON using Groq; None means try Gemini next."""
+    if not GROQ_API_KEY:
+        logger.warning("[%s] GROQ_NO_KEY | trying Gemini", request_id)
+        return None
+    started = time.perf_counter()
+    try:
+        response = requests.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
+            json={
+                "model": GROQ_MODEL,
+                "messages": [
+                    {"role": "system", "content": "Follow the user's evidence and JSON instructions exactly. Return only a JSON object with answer (Hebrew string) and source_ids (integer array). No markdown."},
+                    {"role": "user", "content": prompt},
+                ],
+                "max_completion_tokens": 1600,
+                "reasoning_effort": "low",
+                "temperature": 0.1,
+                "response_format": {"type": "json_object"},
+            },
+            timeout=GROQ_TIMEOUT_SECONDS,
+        )
+        if not response.ok:
+            logger.warning("[%s] GROQ_HTTP_ERROR | status=%s | seconds=%.2f | body=%s",
+                           request_id, response.status_code, time.perf_counter()-started,
+                           response.text[:350])
+            return None
+        choice = response.json().get("choices", [{}])[0]
+        if choice.get("finish_reason") != "stop":
+            logger.warning("[%s] GROQ_INCOMPLETE | finish=%s", request_id, choice.get("finish_reason"))
+            return None
+        raw = (choice.get("message") or {}).get("content") or ""
+        data = json.loads(raw)
+        if not isinstance(data, dict) or not isinstance(data.get("answer"), str) or not isinstance(data.get("source_ids"), list):
+            logger.warning("[%s] GROQ_BAD_JSON_SHAPE", request_id)
+            return None
+        logger.info("[%s] GROQ_OK | seconds=%.2f", request_id, time.perf_counter()-started)
+        return data
+    except (requests.RequestException, ValueError, KeyError, IndexError, TypeError) as error:
+        logger.warning("[%s] GROQ_FAILURE | type=%s | details=%s", request_id, type(error).__name__, str(error)[:250])
         return None
 
 def _make_prompt(question: str, history: list[dict], sources: list[dict], scope: dict) -> str:
@@ -890,14 +1099,23 @@ def _make_prompt(question: str, history: list[dict], sources: list[dict], scope:
     )
 
     car_claim_note = (
+
         "This is a CAR PROPERTY DAMAGE claim. Compulsory motor bodily-injury "
+
         "claims are a DIFFERENT process: do not use bodily-injury documents, "
+
         "submission procedures or reporting deadlines."
+
         if scope.get("car_property") and not scope.get("car_body") else
+
         "This is a CAR BODILY INJURY claim. Do not transfer car property "
+
         "claim documents, coverage or deadlines."
+
         if scope.get("car_body") and not scope.get("car_property") else ""
+
     )
+
     timeline_note = (
 
         "For this water-damage timeline question, do NOT transfer the 14-business-day "
@@ -933,6 +1151,7 @@ STRICT EVIDENCE RULES:
 - Previous conversation determines context; it is NEVER factual evidence.
 
 - {scope_note}
+
 - {car_claim_note}
 
 - {timeline_note}
@@ -944,6 +1163,20 @@ STRICT EVIDENCE RULES:
 - A page about apartment third-party liability is NOT automatically evidence
 
   for an own-apartment water/pipeline damage claim.
+
+- For water/pipeline claims, prioritize the dedicated pipeline-damage source.
+
+  A general apartment-claims page cannot establish a document requirement
+
+  unless the relevant passage explicitly applies to water/pipeline damage.
+
+- List a document as REQUIRED only when a supplied source explicitly requires
+
+  that document for this exact claim type. Never infer required paperwork from
+
+  general claims advice or from other claim types. If unclear, say that the
+
+  precise required documents cannot be confirmed from the available sources.
 
 - If only part of the answer is verified, answer that part only. Explicitly
 
@@ -960,13 +1193,21 @@ STRICT EVIDENCE RULES:
 - Cite only sources directly supporting your factual answer.
 
 RESPONSE LENGTH AND RELEVANCE:
+
 - Answer the exact question first, in clear and natural Hebrew.
+
 - Prefer 1-3 short sentences for simple questions, or at most 3 brief steps for a procedure. Aim for 40-75 Hebrew words when sufficient.
+
 - Do not enumerate every possible claim route, mailing address, phone number or submission channel when the user has not specified a route.
+
   Give the common verified requirements and briefly mention that details depend on the route. Prefer one useful official submission channel, if documented.
+
 - For a bodily-injury claim, explain the general claim submission process if verified;
+
   do not focus on ambulance reimbursement unless the customer asks about it.
+
 - Never omit an essential safety or eligibility qualification just to be brief.
+
 - If the sources support only a narrow case, say so explicitly rather than generalizing.
 
 - Output JSON: answer (Hebrew string), source_ids (array of integer source IDs).
@@ -983,76 +1224,60 @@ CURRENT QUESTION:
 
 {question}"""
 
-def _answer_uncached(question: str, history: list[dict], request_id: str, model: str | None = None) -> dict:
-
+def _answer_uncached(question: str, history: list[dict], request_id: str) -> dict:
     scope = _active_scope(question, history)
-
     logger.info("[%s] ACTIVE_SCOPE | topics=%s | water=%s | timeline=%s",
-
                 request_id, sorted(scope["topics"]), scope["water"], scope["timeline"])
-
     if "car" in scope["topics"]:
         logger.info("[%s] CAR_CLAIM_SCOPE | property=%s | bodily_injury=%s",
                     request_id, scope["car_property"], scope["car_body"])
-    queries = build_retrieval_queries(question, history)
 
-    sources = prepare_sources(retrieve_candidates(queries, request_id), request_id, scope)
-
+    sources = prepare_sources(retrieve_candidates(build_retrieval_queries(question, history), request_id),
+                              request_id, scope)
     if not sources:
-
         logger.warning("[%s] NO_RELEVANT_SOURCES", request_id)
-
         return refusal()
-
-    # For water-specific deadlines, do not ask Gemini to infer a timeline
-
-    # from generic home claims or third-party claim documents.
-
-    if scope["water"] and scope["timeline"] and not any(
-
-        _has_timeline_evidence(source, scope) for source in sources
-
-    ):
-
+    if scope["water"] and scope["timeline"] and not any(_has_timeline_evidence(source, scope) for source in sources):
         logger.info("[%s] WATER_TIMELINE_NO_EVIDENCE | safe refusal", request_id)
-
         return refusal()
 
     prompt = _make_prompt(question, history, sources, scope)
-
     logger.info("[%s] PROMPT_READY | sources=%d | prompt_chars=%d", request_id, len(sources), len(prompt))
 
-    response = generate_answer(prompt, request_id, model=model)
+    # The exact same source excerpts and citation validator are used for every provider.
+    groq_data = _groq_answer(prompt, request_id)
+    if groq_data is not None:
+        result = validate_response(groq_data, sources, request_id, scope)
+        if result["answer"] != ERROR_MESSAGE:
+            return result
+        logger.warning("[%s] GROQ_VALIDATION_FAILED | trying Gemini", request_id)
 
-    if response is None:
+    for model in dict.fromkeys([MODEL_NAME, GEMINI_BACKUP_MODEL]):
+        if not model:
+            continue
+        try:
+            response = generate_answer(prompt, request_id, model=model)
+        except TransientGenerationError as error:
+            logger.warning("[%s] GEMINI_FALLBACK_TRANSIENT | model=%s | reason=%s", request_id, model, error)
+            continue
+        if response is None:
+            continue
+        candidates = response.candidates or []
+        if not candidates or candidates[0].finish_reason != types.FinishReason.STOP:
+            logger.warning("[%s] GEMINI_RESPONSE_INCOMPLETE | model=%s", request_id, model)
+            continue
+        try:
+            data = json.loads((response.text or "").strip())
+        except (ValueError, TypeError):
+            logger.warning("[%s] GEMINI_JSON_PARSE_FAILED | model=%s", request_id, model)
+            continue
+        if not isinstance(data, dict):
+            continue
+        result = validate_response(data, sources, request_id, scope)
+        if result["answer"] != ERROR_MESSAGE:
+            return result
 
-        return technical_error()
-
-    candidates = response.candidates or []
-
-    if not candidates or candidates[0].finish_reason != types.FinishReason.STOP:
-
-        logger.warning("[%s] RESPONSE_ERROR | finish=%s", request_id,
-
-                       candidates[0].finish_reason if candidates else "none")
-
-        return technical_error()
-
-    try:
-
-        data = json.loads((response.text or "").strip())
-
-    except (ValueError, TypeError):
-
-        logger.warning("[%s] JSON_PARSE_FAILED", request_id)
-
-        return technical_error()
-
-    if not isinstance(data, dict):
-
-        return technical_error()
-
-    return validate_response(data, sources, request_id, scope)
+    return technical_error()
 
 def answer_question(question: str, history: list | None = None) -> dict:
 
@@ -1108,69 +1333,10 @@ def answer_question(question: str, history: list | None = None) -> dict:
 
                 return result
 
-            # Each transient failure starts a NEW retrieval -> source filtering ->
-
-            # prompt -> generation -> validation cycle. The original question
-
-            # and clean history are unchanged; errors never enter chat history.
-
-            for attempt in range(1, FULL_PIPELINE_ATTEMPTS + 1):
-
-                attempt_id = f"{request_id}.{attempt}"
-
-                selected_model = (
-
-                    GEMINI_BACKUP_MODEL
-
-                    if GEMINI_BACKUP_MODEL and attempt == FULL_PIPELINE_ATTEMPTS
-
-                    else MODEL_NAME
-
-                )
-
-                logger.info("[%s] FULL_PIPELINE_START | attempt=%d/%d | model=%s",
-
-                            attempt_id, attempt, FULL_PIPELINE_ATTEMPTS, selected_model)
-
-                try:
-
-                    result = _answer_uncached(question, history, attempt_id, model=selected_model)
-
-                except TransientGenerationError as error:
-
-                    logger.warning("[%s] FULL_PIPELINE_TRANSIENT_FAILURE | reason=%s",
-
-                                   attempt_id, str(error))
-
-                    if attempt == FULL_PIPELINE_ATTEMPTS:
-
-                        break
-
-                    delay = min(4.0, float(2 ** (attempt - 1)))
-
-                    logger.info("[%s] FULL_PIPELINE_RESTART | wait_seconds=%.1f",
-
-                                attempt_id, delay)
-
-                    time.sleep(delay)
-
-                    continue
-
-                # Refusal and non-transient failures should NOT trigger extra
-
-                # Gemini requests. The cache layer already skips errors.
-
-                _cache_set(key, result)
-
-                logger.info("[%s] FULL_PIPELINE_FINISH | attempt=%d", attempt_id, attempt)
-
-                return result
-
-            logger.error("[%s] FULL_PIPELINE_EXHAUSTED | attempts=%d",
-
-                         request_id, FULL_PIPELINE_ATTEMPTS)
-
-            return technical_error()
+            # One retrieval pass; fallback between providers uses the same evidence.
+            result = _answer_uncached(question, history, request_id)
+            _cache_set(key, result)
+            return result
 
     except Exception:
 
