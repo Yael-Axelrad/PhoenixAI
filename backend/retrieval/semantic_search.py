@@ -112,6 +112,7 @@ def get_model():
     options.intra_op_num_threads = 1
     options.inter_op_num_threads = 1
     options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+    options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
     options.enable_cpu_mem_arena = False
     options.enable_mem_pattern = False
 
