@@ -24,8 +24,6 @@ from functools import lru_cache
 from pathlib import Path
 from urllib.parse import urlparse
 
-import numpy as np
-from sentence_transformers import SentenceTransformer
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -97,7 +95,9 @@ RRF_K = 60
 
 
 @lru_cache(maxsize=1)
-def get_model() -> SentenceTransformer:
+def get_model():
+    from sentence_transformers import SentenceTransformer
+
     logger.info("Loading embedding model: %s", MODEL_NAME)
     return SentenceTransformer(MODEL_NAME)
 
@@ -119,7 +119,9 @@ def load_chunks() -> list[dict]:
 
 
 @lru_cache(maxsize=1)
-def load_embeddings() -> np.ndarray:
+def load_embeddings():
+    import numpy as np
+
     start = time.perf_counter()
 
     embeddings = np.load(INDEX_FILE, allow_pickle=False)
@@ -139,6 +141,8 @@ def build_index() -> None:
 
     if not chunks:
         raise ValueError("No chunks available for indexing.")
+
+    import numpy as np
 
     model = get_model()
 
@@ -364,6 +368,8 @@ def semantic_search(
 ) -> list[tuple[int, float]]:
     """Search the existing normalized E5 embedding index."""
     chunks = load_chunks()
+    import numpy as np
+
     embeddings = load_embeddings()
 
     if len(chunks) != len(embeddings):
@@ -466,7 +472,7 @@ def search(
 
     lexical_only = os.getenv(
         "RETRIEVAL_LEXICAL_ONLY", "false"
-    ).lower() == "true"
+    ).strip().lower() in {"true", "1", "yes"}
 
     semantic_start = time.perf_counter()
 
