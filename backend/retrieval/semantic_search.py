@@ -2,10 +2,13 @@
 """
 PhoenixAI hybrid retrieval.
 
-Combines dense E5 semantic search, BM25-style lexical search,
-Reciprocal Rank Fusion (RRF), and source diversity.
+Combines:
+1. Dense semantic search using the existing E5 embedding index.
+2. BM25-style lexical search for exact Hebrew terms.
+3. Reciprocal Rank Fusion (RRF) to merge rankings.
+4. Source diversity and irrelevant-page filtering.
 
-Reuses the existing embeddings.npy file.
+The existing embeddings.npy file is reused.
 No crawling or index rebuilding is required.
 """
 
@@ -21,20 +24,22 @@ from functools import lru_cache
 from pathlib import Path
 from urllib.parse import urlparse
 
-import numpy as np
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
 CHUNKS_FILE = PROJECT_ROOT / "data" / "processed" / "chunks.json"
 INDEX_FILE = PROJECT_ROOT / "data" / "processed" / "embeddings.npy"
 
 MODEL_NAME = "intfloat/multilingual-e5-small"
 
 logger = logging.getLogger("phoenixai.search")
+
 LOG_LEVEL = os.getenv("RETRIEVAL_LOG_LEVEL", "INFO").upper()
 logger.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
 
 TOKEN_PATTERN = re.compile(r"[\w\u0590-\u05FF]+", re.UNICODE)
+
 HEBREW_PREFIXES = ("ו", "ה", "ב", "כ", "ל", "מ", "ש")
 
 STOPWORDS = {
@@ -91,116 +96,10 @@ RRF_K = 60
 
 @lru_cache(maxsize=1)
 def get_model():
-    """Load the local quantized E5 model using ONNX Runtime."""
-    import onnxruntime as ort
-    from tokenizers import Tokenizer
+    from sentence_transformers import SentenceTransformer
 
-    model_dir = PROJECT_ROOT / "models" / "e5-onnx"
-    model_path = model_dir / "onnx" / "model_quantized.onnx"
-    tokenizer_path = model_dir / "tokenizer.json"
-
-    if not model_path.is_file() or not tokenizer_path.is_file():
-        raise FileNotFoundError(
-            "ONNX model files are missing. Set Render Build Command to: "
-            "pip install -r requirements-render.txt && "
-            "python scripts/download_e5_onnx.py"
-        )
-
-    logger.info("Loading local quantized ONNX E5 model: %s", model_path)
-
-    options = ort.SessionOptions()
-    options.intra_op_num_threads = 1
-    options.inter_op_num_threads = 1
-    options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
-    options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
-    options.enable_cpu_mem_arena = False
-    options.enable_mem_pattern = False
-
-    session = ort.InferenceSession(
-        str(model_path),
-        sess_options=options,
-        providers=["CPUExecutionProvider"],
-    )
-
-    tokenizer = Tokenizer.from_file(str(tokenizer_path))
-    tokenizer.enable_truncation(max_length=256)
-
-    return E5OnnxEncoder(session, tokenizer)
-
-
-class E5OnnxEncoder:
-    """E5 encoder with attention-mask mean pooling and normalization."""
-
-    def __init__(self, session, tokenizer):
-        self.session = session
-        self.tokenizer = tokenizer
-        self.input_names = {item.name for item in session.get_inputs()}
-
-    def encode(
-        self,
-        texts,
-        normalize_embeddings=True,
-        show_progress_bar=False,
-        batch_size=8,
-    ):
-        single = isinstance(texts, str)
-        values = [texts] if single else list(texts)
-        vectors = []
-
-        for offset in range(0, len(values), batch_size):
-            batch = values[offset:offset + batch_size]
-            encoded = self.tokenizer.encode_batch(batch)
-
-            width = max(len(item.ids) for item in encoded)
-
-            ids = np.zeros(
-                (len(encoded), width),
-                dtype=np.int64,
-            )
-            mask = np.zeros(
-                (len(encoded), width),
-                dtype=np.int64,
-            )
-
-            for row, item in enumerate(encoded):
-                length = len(item.ids)
-                ids[row, :length] = item.ids
-                mask[row, :length] = item.attention_mask
-
-            feeds = {
-                "input_ids": ids,
-                "attention_mask": mask,
-            }
-
-            if "token_type_ids" in self.input_names:
-                feeds["token_type_ids"] = np.zeros_like(ids)
-
-            feeds = {
-                key: value
-                for key, value in feeds.items()
-                if key in self.input_names
-            }
-
-            output = self.session.run(None, feeds)[0]
-
-            weights = mask[..., None].astype(np.float32)
-            pooled = (
-                (output * weights).sum(axis=1)
-                / np.maximum(weights.sum(axis=1), 1)
-            )
-
-            if normalize_embeddings:
-                norms = np.linalg.norm(
-                    pooled,
-                    axis=1,
-                    keepdims=True,
-                )
-                pooled /= np.maximum(norms, 1e-12)
-
-            vectors.extend(pooled.astype(np.float32))
-
-        result = np.asarray(vectors, dtype=np.float32)
-        return result[0] if single else result
+    logger.info("Loading embedding model: %s", MODEL_NAME)
+    return SentenceTransformer(MODEL_NAME)
 
 
 @lru_cache(maxsize=1)
@@ -215,33 +114,56 @@ def load_chunks() -> list[dict]:
         len(chunks),
         time.perf_counter() - start,
     )
+
     return chunks
 
 
 @lru_cache(maxsize=1)
-def load_embeddings() -> np.ndarray:
+def load_embeddings():
+    import numpy as np
+
     start = time.perf_counter()
 
-    embeddings = np.load(
-        INDEX_FILE,
-        allow_pickle=False,
-        mmap_mode="r",
-    )
+    embeddings = np.load(INDEX_FILE, allow_pickle=False)
 
     logger.info(
         "Loaded embedding index: shape=%s in %.2fs",
         embeddings.shape,
         time.perf_counter() - start,
     )
+
     return embeddings
 
 
 def build_index() -> None:
-    """Prevent rebuilding the existing embeddings in the lean runtime."""
-    raise RuntimeError(
-        "Keep existing embeddings.npy. "
-        "Rebuild only in the original PyTorch environment."
+    """Build the dense index when the source corpus changes."""
+    chunks = load_chunks()
+
+    if not chunks:
+        raise ValueError("No chunks available for indexing.")
+
+    import numpy as np
+
+    model = get_model()
+
+    texts = [
+        f"passage: {chunk['title']}\n{chunk['content']}"
+        for chunk in chunks
+    ]
+
+    embeddings = model.encode(
+        texts,
+        normalize_embeddings=True,
+        show_progress_bar=True,
+        batch_size=32,
     )
+
+    INDEX_FILE.parent.mkdir(parents=True, exist_ok=True)
+    np.save(INDEX_FILE, embeddings)
+
+    load_embeddings.cache_clear()
+
+    logger.info("Saved %d embeddings", len(embeddings))
 
 
 def tokenize(text: str) -> list[str]:
@@ -254,17 +176,25 @@ def tokenize(text: str) -> list[str]:
 
 
 def normalize_token(token: str) -> str:
-    """Conservatively remove one common Hebrew prefix."""
+    """
+    Apply conservative normalization.
+
+    Remove a single common Hebrew prefix only when the
+    remaining token is sufficiently long.
+    """
     token = token.lower()
 
-    if len(token) >= 5 and token.startswith(HEBREW_PREFIXES):
+    if (
+        len(token) >= 5
+        and token.startswith(HEBREW_PREFIXES)
+    ):
         return token[1:]
 
     return token
 
 
 def expand_tokens(text: str) -> list[str]:
-    """Include original and normalized token forms."""
+    """Include original and normalized forms."""
     result = []
 
     for token in tokenize(text):
@@ -274,6 +204,7 @@ def expand_tokens(text: str) -> list[str]:
         result.append(token)
 
         normalized = normalize_token(token)
+
         if normalized != token and normalized not in STOPWORDS:
             result.append(normalized)
 
@@ -305,6 +236,7 @@ def is_valid_source(chunk: dict) -> bool:
         return False
 
     content = str(chunk.get("content", "")).strip()
+
     return len(content) >= 80
 
 
@@ -312,6 +244,7 @@ def is_valid_source(chunk: dict) -> bool:
 def get_lexical_index() -> dict:
     """Build a lightweight in-memory BM25 index."""
     start = time.perf_counter()
+
     chunks = load_chunks()
 
     term_frequencies = []
@@ -328,6 +261,7 @@ def get_lexical_index() -> dict:
         title = str(chunk.get("title", ""))
         content = str(chunk.get("content", ""))
 
+        # Repeating title terms improves page-title matching.
         tokens = (
             expand_tokens(title) * 3
             + expand_tokens(content)
@@ -361,6 +295,7 @@ def get_lexical_index() -> dict:
         len(valid_indices),
         time.perf_counter() - start,
     )
+
     return result
 
 
@@ -370,6 +305,7 @@ def lexical_search(
 ) -> list[tuple[int, float]]:
     """Rank chunks using BM25-style lexical relevance."""
     index = get_lexical_index()
+
     query_terms = set(expand_tokens(query))
 
     if not query_terms:
@@ -380,11 +316,13 @@ def lexical_search(
 
     total_documents = index["document_count"]
     average_length = index["average_length"]
+
     scores = []
 
     for document_index in index["valid_indices"]:
         frequencies = index["term_frequencies"][document_index]
         document_length = index["document_lengths"][document_index]
+
         score = 0.0
 
         for term in query_terms:
@@ -420,6 +358,7 @@ def lexical_search(
             scores.append((document_index, score))
 
     scores.sort(key=lambda item: item[1], reverse=True)
+
     return scores[:top_k]
 
 
@@ -429,6 +368,8 @@ def semantic_search(
 ) -> list[tuple[int, float]]:
     """Search the existing normalized E5 embedding index."""
     chunks = load_chunks()
+    import numpy as np
+
     embeddings = load_embeddings()
 
     if len(chunks) != len(embeddings):
@@ -452,6 +393,7 @@ def semantic_search(
     )
 
     indices = np.argsort(scores)[::-1][:candidate_count]
+
     results = []
 
     for index in indices:
@@ -514,7 +456,7 @@ def search(
     Perform hybrid retrieval with RRF.
 
     Returns the original chunk metadata plus:
-    - score
+    - score: fused ranking score
     - semantic_score
     - lexical_score
     """
@@ -525,18 +467,21 @@ def search(
         return []
 
     start = time.perf_counter()
+
     chunks = load_chunks()
 
-    semantic_start = time.perf_counter()
+    lexical_only = os.getenv(
+        "RETRIEVAL_LEXICAL_ONLY", "false"
+    ).strip().lower() in {"true", "1", "yes"}
+
     semantic_start = time.perf_counter()
 
-    if os.getenv("RETRIEVAL_LEXICAL_ONLY", "").lower() == "true":
-        logger.info("Lexical-only retrieval enabled; skipping ONNX")
+    if lexical_only:
         dense_results = []
+        logger.info("Lexical-only retrieval enabled")
     else:
         dense_results = semantic_search(query, top_k=60)
 
-    semantic_seconds = time.perf_counter() - semantic_start
     semantic_seconds = time.perf_counter() - semantic_start
 
     lexical_start = time.perf_counter()
@@ -557,6 +502,8 @@ def search(
     semantic_scores = {}
     lexical_scores = {}
 
+    # Lexical matching receives slightly more weight to
+    # prevent unrelated high-similarity pages from winning.
     for rank, (index, score) in enumerate(dense_results, 1):
         fused_scores[index] += 1.0 / (RRF_K + rank)
         semantic_scores[index] = score
@@ -577,6 +524,7 @@ def search(
         reverse=True,
     )
 
+    # Prefer distinct pages before repeating the same URL.
     selected_indices = []
     seen_urls = set()
     deferred_indices = []
