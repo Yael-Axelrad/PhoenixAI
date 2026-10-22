@@ -20,9 +20,36 @@ type ChatResponse = {
   sources: string[]
 }
 
+type SpeechResult = {
+  isFinal: boolean
+  0: { transcript: string }
+}
+
+type SpeechEvent = {
+  resultIndex: number
+  results: ArrayLike<SpeechResult>
+}
+
+type SpeechErrorEvent = {
+  error: string
+}
+
+type SpeechRecognitionInstance = {
+  lang: string
+  continuous: boolean
+  interimResults: boolean
+  onresult: ((event: SpeechEvent) => void) | null
+  onerror: ((event: SpeechErrorEvent) => void) | null
+  onend: (() => void) | null
+  start: () => void
+  stop: () => void
+}
+
+type SpeechRecognitionConstructor =
+  new () => SpeechRecognitionInstance
+
 const MAX_HISTORY_MESSAGES = 8
 
-// Allow links only to official Phoenix website pages.
 function isOfficialUrl(url: string): boolean {
   try {
     const parsed = new URL(url)
@@ -36,35 +63,245 @@ function isOfficialUrl(url: string): boolean {
   }
 }
 
+function getSpeechRecognition():
+  SpeechRecognitionConstructor | undefined {
+  const speechWindow = window as Window & {
+    SpeechRecognition?: SpeechRecognitionConstructor
+    webkitSpeechRecognition?: SpeechRecognitionConstructor
+  }
+
+  return (
+    speechWindow.SpeechRecognition ??
+    speechWindow.webkitSpeechRecognition
+  )
+}
+
 function App() {
-  // Keep the conversation only while this page is loaded.
   const [isChatOpen, setIsChatOpen] = useState(false)
   const [question, setQuestion] = useState('')
   const [messages, setMessages] = useState<Message[]>([])
   const [loading, setLoading] = useState(false)
 
-  const chatEndRef = useRef<HTMLDivElement>(null)
+  // Voice recognition state
+  const [isListening, setIsListening] = useState(false)
+  const [speechError, setSpeechError] = useState('')
+  const [speechSupported, setSpeechSupported] = useState(false)
+  const [speakingIndex, setSpeakingIndex] = useState<number | null>(null)
+  const [ttsSupported, setTtsSupported] = useState(false)
 
-  // Scroll to the latest message.
+  const chatBodyRef = useRef<HTMLDivElement>(null)
+  const recognitionRef =
+    useRef<SpeechRecognitionInstance | null>(null)
+  const speechBaseTextRef = useRef('')
+  const speechFinalTextRef = useRef('')
+
+  useEffect(() => {
+    setSpeechSupported(Boolean(getSpeechRecognition()))
+    setTtsSupported('speechSynthesis' in window)
+  }, [])
+
   useEffect(() => {
     if (isChatOpen) {
-      chatEndRef.current?.scrollIntoView({
-        behavior: 'smooth',
-        block: 'nearest',
-      })
+      const body = chatBodyRef.current
+      if (body) body.scrollTop = body.scrollHeight
     }
   }, [messages, loading, isChatOpen])
+
+  // Stop recording when the component is removed.
+  useEffect(() => {
+    return () => {
+      window.speechSynthesis?.cancel()
+      if (recognitionRef.current) {
+        recognitionRef.current.onend = null
+        recognitionRef.current.onresult = null
+        recognitionRef.current.onerror = null
+        recognitionRef.current.stop()
+      }
+    }
+  }, [])
+
+  function stopListening() {
+    if (recognitionRef.current) {
+      recognitionRef.current.stop()
+    }
+    setIsListening(false)
+  }
+
+  function toggleMicrophone() {
+    if (isListening) {
+      stopListening()
+      return
+    }
+
+    if (loading) return
+
+    setSpeechError('')
+
+    const SpeechRecognition = getSpeechRecognition()
+
+    if (!SpeechRecognition) {
+      setSpeechError(
+        'הדפדפן שלך אינו תומך בזיהוי דיבור. נסי להשתמש ב-Chrome.'
+      )
+      return
+    }
+
+    // Stop any previous recognition session.
+    if (recognitionRef.current) {
+      recognitionRef.current.onend = null
+      recognitionRef.current.stop()
+      recognitionRef.current = null
+    }
+
+    const recognition = new SpeechRecognition()
+
+    recognition.lang = 'he-IL'
+    recognition.continuous = false
+    recognition.interimResults = true
+
+    speechBaseTextRef.current = question.trim()
+    speechFinalTextRef.current = ''
+
+    recognition.onresult = (event) => {
+      let interimText = ''
+      let finalText = speechFinalTextRef.current
+
+      for (
+        let i = event.resultIndex;
+        i < event.results.length;
+        i++
+      ) {
+        const result = event.results[i]
+        const transcript = result[0].transcript.trim()
+
+        if (result.isFinal) {
+          finalText = [finalText, transcript]
+            .filter(Boolean)
+            .join(' ')
+        } else {
+          interimText = [interimText, transcript]
+            .filter(Boolean)
+            .join(' ')
+        }
+      }
+
+      speechFinalTextRef.current = finalText
+
+      const combinedText = [
+        speechBaseTextRef.current,
+        finalText,
+        interimText,
+      ]
+        .filter(Boolean)
+        .join(' ')
+
+      setQuestion(combinedText.slice(0, 1000))
+    }
+
+    recognition.onerror = (event) => {
+      setIsListening(false)
+
+      switch (event.error) {
+        case 'not-allowed':
+        case 'service-not-allowed':
+          setSpeechError(
+            'אין הרשאה למיקרופון. יש לאפשר גישה למיקרופון בדפדפן.'
+          )
+          break
+
+        case 'no-speech':
+          setSpeechError(
+            'לא זוהה דיבור. נסי לדבר שוב.'
+          )
+          break
+
+        case 'audio-capture':
+          setSpeechError(
+            'לא נמצא מיקרופון זמין במכשיר.'
+          )
+          break
+
+        case 'network':
+          setSpeechError(
+            'שירות זיהוי הדיבור אינו זמין כרגע. בדקי את החיבור לאינטרנט.'
+          )
+          break
+
+        case 'aborted':
+          break
+
+        default:
+          setSpeechError(
+            'אירעה תקלה בזיהוי הדיבור. נסי שוב.'
+          )
+      }
+    }
+
+    recognition.onend = () => {
+      setIsListening(false)
+      recognitionRef.current = null
+    }
+
+    recognitionRef.current = recognition
+
+    try {
+      recognition.start()
+      setIsListening(true)
+    } catch {
+      setIsListening(false)
+      recognitionRef.current = null
+      setSpeechError(
+        'לא ניתן להפעיל את המיקרופון כרגע.'
+      )
+    }
+  }
+
+  function stopSpeaking() {
+    if ('speechSynthesis' in window) window.speechSynthesis.cancel()
+    setSpeakingIndex(null)
+  }
+
+  function toggleSpeaking(text: string, index: number) {
+    if (!('speechSynthesis' in window)) return
+    if (speakingIndex === index) {
+      stopSpeaking()
+      return
+    }
+    stopSpeaking()
+    const cleanText = text
+      .replace(/\[Source\s+\d+\]/gi, '')
+      .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1')
+      .replace(/https?:\/\/\S+/g, '')
+      .replace(/[#*_`>]/g, '')
+      .trim()
+    if (!cleanText) return
+    const utterance = new SpeechSynthesisUtterance(cleanText)
+    utterance.lang = 'he-IL'
+    utterance.rate = 0.95
+    const voices = window.speechSynthesis.getVoices()
+    const hebrewVoice = voices.find((voice) =>
+      voice.lang.toLowerCase().startsWith('he')
+    )
+    if (hebrewVoice) utterance.voice = hebrewVoice
+    utterance.onend = () => setSpeakingIndex(null)
+    utterance.onerror = () => setSpeakingIndex(null)
+    setSpeakingIndex(index)
+    window.speechSynthesis.speak(utterance)
+  }
 
   async function sendMessage(
     event: FormEvent<HTMLFormElement>
   ) {
     event.preventDefault()
 
+    if (isListening) {
+      stopListening()
+    }
+
     const text = question.trim()
 
     if (!text || loading) return
 
-    // Capture conversation history before adding the new question.
     const history = messages
       .slice(-MAX_HISTORY_MESSAGES)
       .map((message) => ({
@@ -81,6 +318,7 @@ function App() {
     ])
 
     setQuestion('')
+    setSpeechError('')
     setLoading(true)
 
     try {
@@ -125,8 +363,23 @@ function App() {
   function clearConversation() {
     if (loading) return
 
+    if (isListening) {
+      stopListening()
+    }
+
+    stopSpeaking()
     setMessages([])
     setQuestion('')
+    setSpeechError('')
+  }
+
+  function closeChat() {
+    stopSpeaking()
+    if (isListening) {
+      stopListening()
+    }
+
+    setIsChatOpen(false)
   }
 
   return (
@@ -242,7 +495,7 @@ function App() {
               <button
                 type="button"
                 className="close-chat"
-                onClick={() => setIsChatOpen(false)}
+                onClick={closeChat}
                 aria-label="סגירת הצ'אט"
               >
                 ×
@@ -250,7 +503,7 @@ function App() {
             </div>
           </header>
 
-          <div className="chat-body">
+          <div className="chat-body" ref={chatBodyRef}>
             {messages.length === 0 && (
               <div className="chat-welcome">
                 <div className="welcome-symbol">✦</div>
@@ -261,6 +514,11 @@ function App() {
                   אפשר לשאול אותי שאלות כלליות
                   על מוצרי הביטוח והשירותים
                   של הפניקס.
+                </p>
+
+                <p>
+                  אפשר גם ללחוץ על המיקרופון
+                  ולשאול שאלה בקול.
                 </p>
               </div>
             )}
@@ -275,6 +533,18 @@ function App() {
                     ? 'את'
                     : 'PhoenixAI'}
                 </div>
+
+                {message.role === 'assistant' && ttsSupported && (
+                  <button
+                    type="button"
+                    className={`speak-button ${speakingIndex === index ? 'speaking' : ''}`}
+                    onClick={() => toggleSpeaking(message.text, index)}
+                    aria-label={speakingIndex === index ? 'עצירת הקראה' : 'הקראת התשובה'}
+                    title={speakingIndex === index ? 'עצירת הקראה' : 'הקראת התשובה בעברית'}
+                  >
+                    {speakingIndex === index ? '■ עצירת הקראה' : '🔊 השמעת תשובה'}
+                  </button>
+                )}
 
                 {message.role === 'assistant' ? (
                   <div className="message-content markdown-content">
@@ -346,7 +616,7 @@ function App() {
               </div>
             )}
 
-            <div ref={chatEndRef} />
+
           </div>
 
           <form
@@ -358,19 +628,64 @@ function App() {
               onChange={(event) =>
                 setQuestion(event.target.value)
               }
-              placeholder="כתבי שאלה..."
+              placeholder={
+                isListening
+                  ? 'מקשיב לך...'
+                  : 'כתבי שאלה או לחצי על המיקרופון...'
+              }
               maxLength={1000}
               aria-label="השאלה שלך"
             />
 
             <button
+              type="button"
+              className={`mic-button ${
+                isListening ? 'mic-listening' : ''
+              }`}
+              onClick={toggleMicrophone}
+              disabled={loading || !speechSupported}
+              aria-label={
+                isListening
+                  ? 'עצירת הקלטה'
+                  : 'התחלת הקלטה קולית'
+              }
+              aria-pressed={isListening}
+              title={
+                !speechSupported
+                  ? 'זיהוי דיבור אינו נתמך בדפדפן זה'
+                  : isListening
+                    ? 'לחצי לעצירת ההאזנה'
+                    : 'לחצי כדי לדבר בעברית'
+              }
+            >
+              {isListening ? '■' : '🎤'}
+            </button>
+
+            <button
               type="submit"
-              disabled={!question.trim() || loading}
+              disabled={
+                !question.trim() ||
+                loading ||
+                isListening
+              }
               aria-label="שליחת שאלה"
             >
               ←
             </button>
           </form>
+
+          {isListening && (
+            <div className="voice-status" role="status">
+              <span className="voice-pulse" />
+              מקשיב לך... לחצי על ■ לסיום
+            </div>
+          )}
+
+          {speechError && (
+            <div className="voice-error" role="alert">
+              {speechError}
+            </div>
+          )}
 
           <div className="chat-disclaimer">
             מידע כללי בלבד · אינו מהווה ייעוץ ביטוחי
