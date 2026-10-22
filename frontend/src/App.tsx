@@ -279,10 +279,17 @@ function App() {
     utterance.lang = 'he-IL'
     utterance.rate = 0.95
     const voices = window.speechSynthesis.getVoices()
-    const hebrewVoice = voices.find((voice) =>
+    const hebrewVoices = voices.filter((voice) =>
       voice.lang.toLowerCase().startsWith('he')
     )
-    if (hebrewVoice) utterance.voice = hebrewVoice
+    // Prefer Hebrew voices with known feminine names when installed.
+    const feminineVoice = hebrewVoices.find((voice) =>
+      /hila|הילה|carmit|כרמית|yael|יעל|female|woman/i.test(
+        `${voice.name} ${voice.voiceURI}`
+      )
+    )
+    const selectedVoice = feminineVoice ?? hebrewVoices[0]
+    if (selectedVoice) utterance.voice = selectedVoice
     utterance.onend = () => setSpeakingIndex(null)
     utterance.onerror = () => setSpeakingIndex(null)
     setSpeakingIndex(index)
@@ -542,7 +549,17 @@ function App() {
                     aria-label={speakingIndex === index ? 'עצירת הקראה' : 'הקראת התשובה'}
                     title={speakingIndex === index ? 'עצירת הקראה' : 'הקראת התשובה בעברית'}
                   >
-                    {speakingIndex === index ? '■ עצירת הקראה' : '🔊 השמעת תשובה'}
+{speakingIndex === index ? (
+                      <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+                        <rect x="6" y="6" width="12" height="12" rx="2" />
+                      </svg>
+                    ) : (
+                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                        <path d="M11 5 6 9H3v6h3l5 4V5Z" />
+                        <path d="M15.5 8.5a5 5 0 0 1 0 7" />
+                        <path d="M18.5 5.5a9 9 0 0 1 0 13" />
+                      </svg>
+                    )}
                   </button>
                 )}
 

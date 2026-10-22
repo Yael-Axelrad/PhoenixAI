@@ -76,7 +76,7 @@ GEMINI_TIMEOUT_MS = max(5000, min(45000, int(os.getenv("GEMINI_TIMEOUT_MS", "120
 
 GEMINI_BACKUP_MODEL = os.getenv("GEMINI_BACKUP_MODEL", "").strip()
 
-CACHE_VERSION = "phoenixai-rag-v13-water-source-precision"
+CACHE_VERSION = "phoenixai-rag-v18-cloud-candidate"
 
 REFUSAL_MESSAGE = "אין לי כרגע מידע מאומת שמאפשר לתת תשובה מדויקת לשאלה הזאת. אפשר לפנות למרכז השירות שלנו לבירור נוסף."
 
@@ -188,27 +188,84 @@ def clean_history(history: list | None) -> list[dict]:
 
     return cleaned
 
+OUT_OF_SCOPE_MESSAGE = (
+    "אני העוזרת הדיגיטלית של PhoenixAI, ואני כאן כדי לעזור בשאלות הקשורות לביטוח. "
+    "אשמח לעזור לך בכל שאלה בנושא ביטוח."
+)
+
+PERSONAL_DETAILS_MESSAGE = (
+    "אין לי גישה לחשבון האישי שלך או למסמכי הפוליסה שלך, ולכן איני יכולה "
+    "למסור מספר פוליסה, סטטוס תביעה או פרטים אישיים. "
+    "אפשר לבדוק את הפרטים באזור האישי או לפנות למרכז השירות שלנו."
+)
+
+PERSONAL_CAVEAT = (
+    "זו תשובה כללית בלבד. אין לי גישה לפוליסה האישית שלך, "
+    "ולכן הכיסוי בפועל תלוי בתנאי הפוליסה ובהרחבות שרכשת."
+)
+
+# Deterministic routing only for unambiguous off-topic requests. Ambiguous
+# questions and follow-ups continue to retrieval rather than being blocked.
+_OFF_TOPIC_CUES = (
+    "עוגיות", "עוגת", "עוגה", "מתכון", "שוקוציפס", "שוקולד צ'יפס",
+    "פסטה", "פיצה", "אורז", "חביתה", "בישול", "לאפות",
+    "מזג האוויר", "מה השעה", "בדיחה", "סרט מומלץ",
+)
+_INSURANCE_CUES = (
+    "ביטוח", "פוליסה", "כיסוי", "תביעה", "הפניקס", "פיצוי", "הרחבה",
+    "פרמיה", "השתתפות עצמית", "רכב", "תאונה", "דירה", "נזק",
+    "נסיעות", "טיסה", "פנסיה", "בריאות", "שרברב",
+)
+
+
+def is_off_topic_question(question: str, history: list[dict]) -> bool:
+    text = question.strip().lower()
+    if any(cue in text for cue in _INSURANCE_CUES):
+        return False
+    # Explicitly unrelated questions should not invoke paid models, even
+    # when an earlier turn discussed insurance.
+    return any(cue in text for cue in _OFF_TOPIC_CUES)
+
+
+def is_personal_details_question(question: str) -> bool:
+    text = question.strip()
+    return any(phrase in text for phrase in (
+        "מספר הפוליסה שלי", "מה מספר הפוליסה", "סטטוס התביעה שלי",
+        "מה מצב התביעה שלי", "כמה שילמתי", "מתי הפוליסה שלי מסתיימת",
+        "מתי נגמרת הפוליסה שלי", "מה מספר התביעה שלי",
+    ))
+
+
 def is_personal_policy_question(question: str) -> bool:
+    # This is a *qualification*, not a reason to refuse retrieval.
+    text = question.strip()
+    return any(phrase in text for phrase in (
+        "הפוליסה שלי", "הכיסוי שלי", "אני מכוסה", "מכסה אותי",
+        "מגיע לי פיצוי", "אני זכאית", "אני זכאי", "הביטוח שלי",
+        "יש לי ביטוח", "האם אקבל החזר", "האם אני מכוסה",
+    ))
 
-    normalized = question.strip()
 
-    personal_terms = (
-
-        "הפוליסה שלי", "הביטוח שלי", "הכיסוי שלי", "הפוליסה האישית",
-
-        "אני מכוסה", "מכסה אותי", "מגיע לי פיצוי", "אני זכאית", "אני זכאי",
-
-    )
-
-    coverage_terms = ("מכסה", "מכוסה", "כיסוי", "פיצוי", "זכאית", "זכאי", "כוללת", "כלול", "כלולה")
-
-    return any(t in normalized for t in personal_terms) and any(t in normalized for t in coverage_terms)
+def qualify_personal_answer(question: str, result: dict) -> dict:
+    if not is_personal_policy_question(question):
+        return result
+    if result.get("answer") == ERROR_MESSAGE:
+        return result
+    if result.get("answer") == REFUSAL_MESSAGE:
+        return personal_policy_response()
+    if result.get("answer") == PERSONAL_POLICY_MESSAGE:
+        return result
+    answer = result.get("answer", "")
+    if PERSONAL_CAVEAT not in answer:
+        return {"answer": answer.rstrip() + "\n\n" + PERSONAL_CAVEAT,
+                "sources": result.get("sources", [])}
+    return result
 
 # Explicit topic cues prevent unrelated insurance products from leaking into follow-ups.
 
 TOPIC_CUES = {
 
-    "apartment": ("דירה", "בדירה", "לבית", "נזקי מים", "נזילה", "צנרת", "שרברב", "מבנה", "תכולה"),
+    "apartment": ("דירה", "בדירה", "לבית", "בבית", "הבית", "צינור", "צינורות", "הצפה", "מציפים", "מים", "נזקי מים", "נזילה", "צנרת", "שרברב", "אינסטלטור", "מבנה", "תכולה"),
 
     "car": ("רכב", "לרכב", "מכונית", "נהיגה", "נהג", "ביטוח מקיף", "תאונת דרכים", "ביטוח חובה"),
 
@@ -246,7 +303,7 @@ PRODUCT_PATHS = {
 
 # Do not treat a generic third-party home claim as a water-damage claim.
 
-WATER_TERMS = ("נזקי מים", "נזק מים", "נזקי צנרת", "נזק צנרת", "צנרת", "נזילה", "שרברב")
+WATER_TERMS = ("נזקי מים", "נזק מים", "נזקי צנרת", "נזק צנרת", "צנרת", "נזילה", "שרברב", "צינור", "הצפה", "מציפים", "אינסטלטור")
 
 THIRD_PARTY_TERMS = ("צד ג'", "צד ג׳", "צד שלישי", "צד 3")
 
@@ -580,7 +637,7 @@ def _cached_search(query: str) -> list[dict]:
 
             return _search_cache[query]
 
-        results = search(query, top_k=8)
+        results = search(query, top_k=16)
 
         _search_cache[query] = results
 
@@ -628,16 +685,31 @@ def prepare_sources(candidates: list[dict], request_id: str, scope: dict | None 
 
     selected, deferred, seen_urls = [], [], set()
 
-    # Prioritize the dedicated pipeline-damage procedure over generic articles.
-    # Do not discard other relevant apartment pages: they can supply context.
+    # Keep the retrieval engine's rank as the baseline.  The previous
+    # substring-based reranker rewarded incidental words in unrelated pages
+    # (for example, a dog-bite article outranking a flood guide).
+    # Only apply a narrow, evidence-based boost for the clearly detected
+    # water-damage intent; do not re-rank unrelated domains by hand.
     if scope and scope.get("water") and not scope.get("third_party"):
-        candidates = sorted(
-            candidates,
-            key=lambda item: (
-                "pipeline-damage" not in urlparse(str(item.get("url", ""))).path.lower(),
-                -float(item.get("_ranking_score", 0.0)),
-            ),
-        )
+        def water_priority(item: dict) -> tuple[int, float]:
+            path = urlparse(str(item.get("url", ""))).path.lower()
+            title = str(item.get("title", ""))
+            if "pipeline-damage" in path:
+                priority = 5
+            elif "water-plumbing-damages" in path:
+                priority = 5
+            elif "apartment-flood-costs" in path:
+                priority = 5
+            elif "apartment-winter-damages" in path:
+                priority = 4
+            elif any(term in title for term in ("הצפה", "נזקי מים", "צנרת", "נזילה")):
+                priority = 3
+            else:
+                priority = 0
+            return (priority, float(item.get("_ranking_score", 0.0)))
+
+        candidates = sorted(candidates, key=water_priority, reverse=True)
+    # For all other questions, retain the original search ranking.
 
     for item in candidates:
 
@@ -715,6 +787,31 @@ def _polish_service_style(answer: str) -> str:
 
     return answer.strip()
 
+def _unsafe_coverage_claim(question: str, answer: str) -> bool:
+    """Reject a few high-risk contradictions; this is not a general fact checker."""
+    q = question.lower()
+    a = answer.lower()
+    if ("חלוד" in q or "חליד" in q or "קורוזיה" in q) and ("צנרת" in q):
+        if any(x in a for x in ("מכסה את ההחלפה", "נחשבת לכיסוי", "מכוסה בביטוח", "כולל כיסוי")) and not any(x in a for x in ("לא מכסה", "אינו מכסה", "אינה מכסה", "לא מכוסה")):
+            return True
+    if "חובה" in q and ("מקיף" in q or "צד ג" in q):
+        if any(x in a for x in ("נזקי רכוש של צד", "נזק לרכב של צד", "כולל את כיסוי הביטוח החובה", "מכסה גם נזקי רכוש")):
+            return True
+    if "סקי" in q and ("צלילה" in q or "ספורט אתגרי" in q):
+        if any(x in a for x in ("הרחבה אחת", "אותה הרחבה", "כולל גם צלילה וגם סקי")) and not any(x in a for x in ("לא מספיקה", "נפרדת", "שתי הרחבות")):
+            return True
+    if "ברח" in q and ("רכב" in q or "חניה" in q):
+        if "צד ג" in a and not any(x in a for x in ("לא מכסה", "אינו מכסה", "לא ישלם", "לא ניתן")):
+            return True
+    if "מפתחות" in q and any(x in q for x in ("נגנב", "גניב")):
+        if any(x in a for x in ("גם אם המפתחות", "אפילו אם המפתחות", "בוודאות מכוסה", "חייבת לפצות", "חייבים לפצות")):
+            return True
+    if "צד ג" in q and any(x in q for x in ("פגע ברכב שלי", "פגע ברכב", "פגעו ברכב שלי")):
+        if any(x in a for x in ("חברת הביטוח של רכבו של הנפגע", "ביטוח צד ג' שלך יכסה", "ביטוח צד ג׳ שלך יכסה")):
+            return True
+    return False
+
+
 def validate_response(data: dict, sources: list[dict], request_id: str, scope: dict | None = None) -> dict:
 
     answer, ids = data.get("answer"), data.get("source_ids")
@@ -726,6 +823,10 @@ def validate_response(data: dict, sources: list[dict], request_id: str, scope: d
         return technical_error()
 
     answer = answer.strip()
+
+    if _unsafe_coverage_claim(scope.get("question", "") if scope else "", answer):
+        logger.warning("[%s] UNSAFE_COVERAGE_CLAIM | refusing", request_id)
+        return refusal()
 
     if answer == REFUSAL_MESSAGE or not ids:
 
@@ -1156,6 +1257,34 @@ STRICT EVIDENCE RULES:
 
 - {timeline_note}
 
+- IMPORTANT: Israeli compulsory motor insurance (ביטוח חובה) covers bodily injury,
+  NOT vehicle property damage. Third-party motor insurance (צד ג) covers liability
+  for OTHER people's property, NOT damage to the policyholder's own car.
+  Comprehensive insurance does NOT replace compulsory insurance.
+- Ski/winter sports and scuba/extreme sports may require DIFFERENT extensions;
+  never claim one extension covers both unless the supplied source explicitly says so.
+- Rust, corrosion and normal wear of pipes are excluded by the pipeline claims page;
+  do not claim replacement of corroded pipes is covered.
+- Never guarantee compensation for theft with keys left in a vehicle: actual
+  eligibility depends on policy conditions and the claim investigation.
+- Distinguish the at-fault driver from the injured car owner. When another
+  driver hits the customer's car, the customer's own third-party policy does
+  not pay for their own damage; recovery may depend on the other driver's
+  liability and insurer. Do not reverse the parties.
+- For a customer's third-party-only insurance question, answer the actual
+  coverage distinction FIRST, before any personal-policy caveat. Never answer
+  solely with "I cannot access your policy" when the general product coverage
+  distinction is supported by the cited source.
+- For a theft question mentioning keys left inside, distinguish general
+  comprehensive theft coverage from the unresolved keys-left-inside condition.
+  Do not give a blanket yes OR blanket no, and do not silently ignore the keys.
+- If the question asks for immediate steps after home flooding, provide only
+  supported safe general steps from a directly relevant source; if no source
+  supports practical steps, do not invent claims procedures.
+- For water damage, distinguish an approved network plumber from a private
+  plumber; do not instruct everyone to file the same digital claim.
+- If a car was damaged by an unknown hit-and-run driver, third-party liability
+  insurance alone does not insure damage to the customer's own car.
 - Never transfer conditions, deadlines, claim documents or coverages between
 
   different insurance products OR different claim subtypes.
@@ -1226,6 +1355,7 @@ CURRENT QUESTION:
 
 def _answer_uncached(question: str, history: list[dict], request_id: str) -> dict:
     scope = _active_scope(question, history)
+    scope["question"] = question
     logger.info("[%s] ACTIVE_SCOPE | topics=%s | water=%s | timeline=%s",
                 request_id, sorted(scope["topics"]), scope["water"], scope["timeline"])
     if "car" in scope["topics"]:
@@ -1246,6 +1376,26 @@ def _answer_uncached(question: str, history: list[dict], request_id: str) -> dic
 
     # The exact same source excerpts and citation validator are used for every provider.
     groq_data = _groq_answer(prompt, request_id)
+    if groq_data is not None and _unsafe_coverage_claim(question, str(groq_data.get("answer", ""))):
+        # One bounded retry, using the same verified source excerpts. Never
+        # replace a risky answer with an uncited, hard-coded coverage claim.
+        logger.warning("[%s] UNSAFE_COVERAGE_RETRY | requesting qualified answer", request_id)
+        correction = (
+            "\n\nCRITICAL CORRECTION FOR THE CURRENT QUESTION: Your previous answer "
+            "made an unsupported or misleading coverage claim. Rewrite the answer "
+            "using only the numbered source excerpts above. Clearly distinguish "
+            "the person whose vehicle was damaged from the driver who caused it. "
+            "For theft with keys left in the vehicle, NEVER guarantee coverage or "
+            "denial; explain the general comprehensive theft coverage only if "
+            "supported, and state that keys-left-inside eligibility cannot be "
+            "confirmed without the policy terms and investigation. "
+            "Answer the useful verified portion rather than refusing wholesale. "
+            "If no direct evidence supports any substantive answer, return the "
+            "specified refusal message with source_ids=[]. Return JSON only."
+        )
+        revised = _groq_answer(prompt + correction, request_id)
+        if revised is not None:
+            groq_data = revised
     if groq_data is not None:
         result = validate_response(groq_data, sources, request_id, scope)
         if result["answer"] != ERROR_MESSAGE:
@@ -1297,11 +1447,13 @@ def answer_question(question: str, history: list | None = None) -> dict:
 
     try:
 
-        if is_personal_policy_question(question):
+        if is_off_topic_question(question, history):
+            logger.info("[%s] OUT_OF_SCOPE", request_id)
+            return {"answer": OUT_OF_SCOPE_MESSAGE, "sources": []}
 
-            logger.info("[%s] PERSONAL_POLICY_BOUNDARY", request_id)
-
-            return personal_policy_response()
+        if is_personal_details_question(question):
+            logger.info("[%s] PERSONAL_DETAILS_BOUNDARY", request_id)
+            return {"answer": PERSONAL_DETAILS_MESSAGE, "sources": []}
 
         key = _cache_key(question, history)
 
@@ -1311,15 +1463,10 @@ def answer_question(question: str, history: list | None = None) -> dict:
 
             logger.info("[%s] CACHE_HIT | no Gemini call", request_id)
 
-            return result
+            return qualify_personal_answer(question, result)
 
         logger.info("[%s] CACHE_MISS", request_id)
 
-        if _quota_blocked():
-
-            logger.warning("[%s] QUOTA_COOLDOWN | no retrieval", request_id)
-
-            return technical_error()
 
         # Only one thread computes an identical cache key at a time.
 
@@ -1331,10 +1478,11 @@ def answer_question(question: str, history: list | None = None) -> dict:
 
                 logger.info("[%s] CACHE_HIT_AFTER_WAIT | no Gemini call", request_id)
 
-                return result
+                return qualify_personal_answer(question, result)
 
             # One retrieval pass; fallback between providers uses the same evidence.
             result = _answer_uncached(question, history, request_id)
+            result = qualify_personal_answer(question, result)
             _cache_set(key, result)
             return result
 

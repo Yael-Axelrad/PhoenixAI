@@ -61,8 +61,32 @@ body { overflow-x: hidden; }
 .voice-status { display: flex; align-items: center; justify-content: center; gap: 8px; color: #be123c; background: #fff1f2; }
 .voice-error { color: #b91c1c; background: #fef2f2; }
 .voice-pulse { width: 8px; height: 8px; background: #e11d48; border-radius: 50%; animation: microphone-pulse 1s infinite; }
-.speak-button { display: inline-flex; align-items: center; margin-bottom: 9px; padding: 5px 9px; border: 1px solid #dce2ed; border-radius: 20px; background: #f6f8fc; color: #174a97; font-size: 11px; cursor: pointer; }
-.speak-button:hover, .speak-button.speaking { background: #e1eafa; }
+/* Clear, accessible playback control in the answer card */
+.chat-message.assistant { position: relative; }
+.chat-message.assistant .message-author { min-height: 35px; display: flex; align-items: flex-start; padding-top: 3px; padding-left: 46px; }
+.speak-button {
+  position: absolute;
+  top: 9px;
+  left: 11px;
+  width: 36px;
+  height: 36px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border: 0;
+  border-radius: 12px;
+  background: #183b82;
+  color: #fff;
+  box-shadow: 0 3px 9px rgba(24, 59, 130, .22);
+  cursor: pointer;
+  transition: background .18s ease, transform .18s ease;
+}
+.speak-button svg { width: 21px; height: 21px; display: block; }
+.speak-button:hover { background: #2856b0; transform: translateY(-1px); }
+.speak-button.speaking { background: #f15a35; }
+.speak-button:focus-visible { outline: 3px solid #91b5ff; outline-offset: 2px; }
+@media (prefers-reduced-motion: reduce) { .speak-button { transition: none; } }
 .thinking-indicator { align-self: flex-end; display: flex; align-items: center; justify-content: center; gap: 6px; width: 64px; height: 46px; background: white; border: 1px solid #e6eaf0; border-radius: 24px; box-shadow: 0 4px 14px rgba(17,29,64,.07); flex-shrink: 0; }
 .thinking-dot { width: 7px; height: 7px; border-radius: 50%; background: #ff6333; animation: thinking-bounce 1s ease-in-out infinite; }
 .thinking-dot:nth-child(2) { animation-delay: .15s; }
